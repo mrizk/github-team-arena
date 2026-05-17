@@ -83,7 +83,8 @@
     background: transparent; color: var(--text-muted); font-size: 12px; cursor: pointer; font-weight: 600;
   }
   .back-btn:hover { background: var(--surface-hover); color: var(--text); }
-  .header-actions { display: flex; gap: 8px; }
+  .back-btn.anon-active { background: var(--purple-glow); color: var(--purple); border-color: var(--purple); }
+  .header-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
   .warning-banner {
     background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.35); border-radius: 10px;
@@ -250,6 +251,44 @@ const MEDAL = ['🥇','🥈','🥉'];
 const FIRE = { commits: 5, reviews: 3 };
 const DEFAULT_EXCLUDE_PREFIXES = 'staging/';
 
+const ANON_NAMES = [
+  'Adventurous Alpaca','Bouncing Beaver','Clever Cucumber','Daring Dolphin',
+  'Eager Eagle','Fearless Falcon','Gallant Giraffe','Happy Hedgehog',
+  'Inventive Ibis','Jolly Jellyfish','Kind Koala','Lively Lemur',
+  'Mighty Mango','Nimble Narwhal','Optimistic Octopus','Peppy Penguin',
+  'Quirky Quokka','Radiant Raccoon','Sneaky Sloth','Tactical Toucan',
+  'Unstoppable Unicorn','Vivid Vulture','Wacky Walrus','Xenial Xerus',
+  'Yodeling Yak','Zealous Zebra','Aspiring Antelope','Brave Badger',
+  'Cheerful Chinchilla','Dapper Donkey','Energetic Echidna','Fancy Ferret',
+  'Glowing Gecko','Hilarious Hamster','Iconic Iguana','Jubilant Jackal',
+  'Keen Kangaroo','Loyal Llama','Magical Meerkat','Noble Newt',
+  'Outgoing Otter','Plucky Panda','Quaint Quail','Rapid Rabbit',
+  'Sleek Seal','Trusty Turtle','Upbeat Urchin','Valiant Viper',
+  'Wise Wombat','Young Yeti',
+];
+
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+function buildAnonMap(logins) {
+  const map = {};
+  const ordered = [...logins].sort((a, b) => hashStr(a) - hashStr(b) || a.localeCompare(b));
+  ordered.forEach((login, i) => {
+    const base = ANON_NAMES[i % ANON_NAMES.length];
+    const round = Math.floor(i / ANON_NAMES.length);
+    map[login] = round === 0 ? base : `${base} ${round + 1}`;
+  });
+  return map;
+}
+
+function displayName(login) {
+  if (!state.anonymized || !login) return login;
+  return state.anonMap[login] || login;
+}
+
 const ALLOWED_DAYS = [7, 14, 30, 60];
 
 function getInitialConfig() {
@@ -292,6 +331,7 @@ let state = {
   excludePrefixes: initialConfig.excludePrefixes,
   data: null, tab: 'leaderboard', loading: false, error: null, loadingMsg: '',
   cacheStats: null, warnings: [],
+  anonymized: false, anonMap: {},
 };
 
 function getWeekStart(dateStr) {
@@ -426,6 +466,19 @@ function avatarEl(login, size = 36) {
     img.replaceWith(fb);
   };
   return img;
+}
+
+function userAvatarEl(login, size = 36) {
+  if (state.anonymized) {
+    const name = displayName(login) || '?';
+    const hues = [200,160,280,340,30,60,120];
+    let h = 0; for (let i=0;i<name.length;i++) h = name.charCodeAt(i)+((h<<5)-h);
+    return el('div', { className: 'avatar-fallback' + (size > 40 ? ' lg' : ''), style: {
+      width: size+'px', height: size+'px', fontSize: (size*0.45)+'px',
+      background: `hsl(${hues[Math.abs(h)%hues.length]},70%,65%)`
+    }}, name[0]?.toUpperCase() || '?');
+  }
+  return avatarEl(login, size);
 }
 
 class GitHubError extends Error {
@@ -638,6 +691,7 @@ async function loadData() {
     while (dd <= now) { allDays.push(dd.toISOString().slice(0,10)); dd.setDate(dd.getDate()+1); }
     const allWeeks = [...new Set(allDays.map(getWeekStart))].sort();
     const allUsers = [...new Set([...Object.keys(userCommits),...Object.keys(userReviews),...Object.keys(userPRs)])].sort();
+    state.anonMap = buildAnonMap(allUsers);
 
     state.data = {
       commitsByUD, reviewsByUD, prsByWeek, prsByUW,
@@ -698,7 +752,8 @@ function renderCommitItems(container, items) {
     item.append(titleRow);
 
     const meta = el('div',{className:'item-meta'});
-    meta.append(el('span',{},c.commit?.author?.name || c.author?.login || 'unknown'));
+    const authorKey = c.author?.login || c.commit?.author?.name;
+    meta.append(el('span',{}, displayName(authorKey) || 'unknown'));
     meta.append(el('span',{},timeAgo(c.commit?.author?.date)));
     entry.branches.slice(0,3).forEach(b => meta.append(el('span',{className:'branch-tag'},b)));
     if (entry.branches.length > 3) meta.append(el('span',{className:'branch-tag'},`+${entry.branches.length-3}`));
@@ -715,7 +770,7 @@ function renderReviewItems(container, items) {
   items.forEach(r => {
     const item = el('div',{className:'review-item'});
     const titleRow = el('div',{className:'item-title'});
-    titleRow.append(el('a',{href:r.html_url}, `${r.user?.login} on ${r.path||'file'}:${r.original_line||r.line||''}`));
+    titleRow.append(el('a',{href:r.html_url}, `${displayName(r.user?.login) || 'unknown'} on ${r.path||'file'}:${r.original_line||r.line||''}`));
     item.append(titleRow);
 
     const meta = el('div',{className:'item-meta'});
@@ -739,7 +794,7 @@ function renderPRItems(container, items) {
     item.append(titleRow);
 
     const meta = el('div',{className:'item-meta'});
-    meta.append(el('span',{},p.user?.login || 'unknown'));
+    meta.append(el('span',{}, displayName(p.user?.login) || 'unknown'));
     meta.append(el('span',{},`merged ${timeAgo(p.merged_at)}`));
     if(p.additions!=null) meta.append(el('span',{style:{color:'var(--green)'}},`+${p.additions}`));
     if(p.deletions!=null) meta.append(el('span',{style:{color:'var(--red)'}},`-${p.deletions}`));
@@ -765,9 +820,9 @@ function leaderCard(rank, login, value, label, unitLabel, color, glowColor, onFi
   card.onmouseenter = ()=>{card.style.boxShadow=`0 8px 24px ${glowColor}`;};
   card.onmouseleave = ()=>{card.style.boxShadow=isTop?`0 0 30px ${glowColor}`:'none';};
 
-  card.append(el('div',{className:'rank'},MEDAL[rank]||`#${rank+1}`), avatarEl(login, isTop?44:36));
+  card.append(el('div',{className:'rank'},MEDAL[rank]||`#${rank+1}`), userAvatarEl(login, isTop?44:36));
   const info = el('div',{className:'info'});
-  const nameEl = el('div',{className:'name'},login);
+  const nameEl = el('div',{className:'name'}, displayName(login));
   if(onFire) nameEl.append(el('span',{title:'On fire!',style:{fontSize:'16px'}},' 🔥'));
   info.append(nameEl, el('div',{className:'detail'},label));
   card.append(info);
@@ -793,7 +848,7 @@ function renderHeatTable(dataMap, rawDataMap, days, leaders, color, colorRGB, ty
     const tr = el('tr');
     const uCell = el('td');
     const uw = el('div',{className:'user-cell'});
-    uw.append(avatarEl(login,22), el('span',{},login));
+    uw.append(userAvatarEl(login,22), el('span',{}, displayName(login)));
     uCell.append(uw); tr.append(uCell);
 
     days.forEach(d=>{
@@ -811,7 +866,7 @@ function renderHeatTable(dataMap, rawDataMap, days, leaders, color, colorRGB, ty
       if (v > 0) {
         td.addEventListener('click', () => {
           const items = rawDataMap[key] || [];
-          const title = `${login} — ${dayLabel(d)}`;
+          const title = `${displayName(login)} — ${dayLabel(d)}`;
           openDrawer(title, body => {
             if (type === 'commits') renderCommitItems(body, items);
             else renderReviewItems(body, items);
@@ -906,6 +961,11 @@ function renderDashboard() {
   header.append(hLeft);
   const actions = el('div',{className:'header-actions'});
   actions.append(
+    el('button',{
+      className:'back-btn'+(state.anonymized?' anon-active':''),
+      onClick:()=>{state.anonymized=!state.anonymized;closeDrawer();renderDashboard();},
+      title: state.anonymized ? 'Show real names and avatars' : 'Hide real names and avatars',
+    }, state.anonymized ? '👁 Reveal' : '🎭 Anonymize'),
     el('button',{className:'back-btn',onClick:loadData,title:'Re-fetch from GitHub'},'↻ Refresh'),
     el('button',{className:'back-btn',onClick:()=>{state.data=null;state.error=null;render();}},'← Back'),
   );
@@ -950,7 +1010,7 @@ function renderDashboard() {
     cl.slice(0,5).forEach(([login,v],i)=>{
       sec1.append(leaderCard(i,login,v,`${v} commit${v!==1?'s':''} in ${state.days}d`,'commits','var(--accent)','var(--accent-glow)',
         (d.todayCommits[login]||0)>=FIRE.commits,
-        ()=>openDrawer(`⚡ ${login} — All Commits`, body=>renderCommitItems(body, d.rawCommitsByUser[login]))
+        ()=>openDrawer(`⚡ ${displayName(login)} — All Commits`, body=>renderCommitItems(body, d.rawCommitsByUser[login]))
       ));
     });
     grid.append(sec1);
@@ -962,7 +1022,7 @@ function renderDashboard() {
     rl.slice(0,5).forEach(([login,v],i)=>{
       sec2.append(leaderCard(i,login,v,`${v} review comment${v!==1?'s':''}`,'reviews','var(--purple)','var(--purple-glow)',
         (d.todayReviews[login]||0)>=FIRE.reviews,
-        ()=>openDrawer(`💬 ${login} — All Reviews`, body=>renderReviewItems(body, d.rawReviewsByUser[login]))
+        ()=>openDrawer(`💬 ${displayName(login)} — All Reviews`, body=>renderReviewItems(body, d.rawReviewsByUser[login]))
       ));
     });
     grid.append(sec2);
@@ -973,7 +1033,7 @@ function renderDashboard() {
     if(!pl.length) sec3.append(el('p',{className:'empty'},'No merged PRs yet'));
     pl.slice(0,5).forEach(([login,v],i)=>{
       sec3.append(leaderCard(i,login,v,`${v} merged PR${v!==1?'s':''}`,'prs','var(--green)','var(--green-glow)',false,
-        ()=>openDrawer(`🚀 ${login} — Merged PRs`, body=>renderPRItems(body, d.rawPRsByUser[login]))
+        ()=>openDrawer(`🚀 ${displayName(login)} — Merged PRs`, body=>renderPRItems(body, d.rawPRsByUser[login]))
       ));
     });
     grid.append(sec3);
@@ -1030,7 +1090,7 @@ function renderDashboard() {
       const tr = el('tr');
       const uCell = el('td');
       const uw = el('div',{className:'user-cell'});
-      uw.append(avatarEl(login,22),el('span',{},login));
+      uw.append(userAvatarEl(login,22),el('span',{}, displayName(login)));
       uCell.append(uw); tr.append(uCell);
       d.allWeeks.forEach(w=>{
         const key = `${login}||${w}`;
@@ -1044,7 +1104,7 @@ function renderDashboard() {
         },v||'·');
         if (v > 0) {
           td.addEventListener('click', () => {
-            openDrawer(`🚀 ${login} — ${weekLabel(w)}`, body => renderPRItems(body, d.rawPRsByUW[key]));
+            openDrawer(`🚀 ${displayName(login)} — ${weekLabel(w)}`, body => renderPRItems(body, d.rawPRsByUW[key]));
           });
         }
         tr.append(td);
