@@ -240,8 +240,26 @@ const el = (tag, attrs = {}, ...children) => {
 
 const MEDAL = ['🥇','🥈','🥉'];
 const FIRE = { commits: 5, reviews: 3 };
+const DEFAULT_EXCLUDE_PREFIXES = 'staging/';
 
-let state = { token: '', repo: '', days: 14, data: null, tab: 'leaderboard', loading: false, error: null, loadingMsg: '' };
+function getInitialExcludePrefixes() {
+  const fromUrl = new URLSearchParams(window.location.search).get('exclude');
+  if (fromUrl != null) return fromUrl;
+  return localStorage.getItem('arena_exclude_prefixes') ?? DEFAULT_EXCLUDE_PREFIXES;
+}
+function parseExcludePrefixes(str) {
+  return (str || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+function isExcluded(name, prefixes) {
+  return prefixes.some(p => name.startsWith(p));
+}
+
+let state = {
+  token: '', repo: '', days: 14,
+  excludePrefixes: getInitialExcludePrefixes(),
+  data: null, tab: 'leaderboard', loading: false, error: null, loadingMsg: '',
+  cacheStats: null,
+};
 
 function getWeekStart(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
@@ -267,6 +285,101 @@ function timeAgo(dateStr) {
   return `${days}d ago`;
 }
 function shortSha(sha) { return sha?.slice(0,7) || ''; }
+
+// ── Encrypted commit cache (AES-GCM key derived from token via PBKDF2) ──
+// Commits are immutable by SHA, so we cache them indefinitely and use the
+// last-fetch timestamp per branch to fetch only new commits incrementally.
+const CACHE_PREFIX = 'arena_cache_v1_';
+const SALT_KEY = 'arena_salt_v1';
+const CACHE_MAX_AGE_DAYS = 90;
+const TE = new TextEncoder();
+const TD = new TextDecoder();
+const b64enc = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const b64dec = str => Uint8Array.from(atob(str), c => c.charCodeAt(0));
+
+function getSalt() {
+  let salt = localStorage.getItem(SALT_KEY);
+  if (!salt) {
+    salt = b64enc(crypto.getRandomValues(new Uint8Array(16)));
+    localStorage.setItem(SALT_KEY, salt);
+  }
+  return b64dec(salt);
+}
+
+let keyCache = { token: null, key: null };
+async function deriveKey(token) {
+  if (keyCache.token === token && keyCache.key) return keyCache.key;
+  const baseKey = await crypto.subtle.importKey(
+    'raw', TE.encode(token), { name: 'PBKDF2' }, false, ['deriveKey']
+  );
+  const key = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: getSalt(), iterations: 100000, hash: 'SHA-256' },
+    baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt','decrypt']
+  );
+  keyCache = { token, key };
+  return key;
+}
+
+async function encryptJSON(obj, token) {
+  const key = await deriveKey(token);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv }, key, TE.encode(JSON.stringify(obj))
+  );
+  return { iv: b64enc(iv), ct: b64enc(ct) };
+}
+async function decryptJSON(blob, token) {
+  const key = await deriveKey(token);
+  const data = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: b64dec(blob.iv) }, key, b64dec(blob.ct)
+  );
+  return JSON.parse(TD.decode(data));
+}
+
+const cacheStorageKey = repo => CACHE_PREFIX + repo.replace(/[^\w.-]/g, '_');
+
+async function loadCache(repo, token) {
+  const raw = localStorage.getItem(cacheStorageKey(repo));
+  if (!raw) return null;
+  try { return await decryptJSON(JSON.parse(raw), token); }
+  catch {
+    // Wrong token or corrupt blob — drop it so we don't keep retrying.
+    localStorage.removeItem(cacheStorageKey(repo));
+    return null;
+  }
+}
+
+async function saveCache(repo, token, data) {
+  try {
+    const blob = await encryptJSON(data, token);
+    localStorage.setItem(cacheStorageKey(repo), JSON.stringify(blob));
+  } catch (e) {
+    console.warn('Cache save failed:', e);
+  }
+}
+
+function pruneCache(cache) {
+  const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - CACHE_MAX_AGE_DAYS);
+  const keep = new Set();
+  for (const [sha, c] of Object.entries(cache.commits)) {
+    const d = c?.commit?.author?.date;
+    if (!d || new Date(d) >= cutoff) keep.add(sha);
+  }
+  for (const sha of Object.keys(cache.commits)) {
+    if (!keep.has(sha)) delete cache.commits[sha];
+  }
+  for (const info of Object.values(cache.branchSHAs)) {
+    info.shas = info.shas.filter(sha => keep.has(sha));
+  }
+}
+
+function clearAllCaches() {
+  for (let i = localStorage.length - 1; i >= 0; i--) {
+    const k = localStorage.key(i);
+    if (k && (k.startsWith(CACHE_PREFIX) || k === SALT_KEY)) localStorage.removeItem(k);
+  }
+  keyCache = { token: null, key: null };
+}
 
 function avatarEl(login, size = 36) {
   const img = el('img', { src: `https://github.com/${login}.png?size=80`, className: size > 40 ? 'avatar lg' : 'avatar' });
@@ -308,32 +421,77 @@ function isMergeMainCommit(msg) {
 }
 
 async function loadData() {
-  state.loading = true; state.error = null; state.loadingMsg = 'Fetching branches…'; render();
+  state.loading = true; state.error = null; state.loadingMsg = 'Loading…';
+  state.cacheStats = { fromCache: 0, fromApi: 0 };
+  render();
   try {
     const since = new Date(); since.setDate(since.getDate() - state.days);
     const sinceISO = since.toISOString();
     const base = `https://api.github.com/repos/${state.repo}`;
+    const excludePrefixes = parseExcludePrefixes(state.excludePrefixes);
+    localStorage.setItem('arena_exclude_prefixes', state.excludePrefixes);
 
-    // 1. Fetch all branches
+    state.loadingMsg = 'Loading cache…'; render();
+    const cache = (await loadCache(state.repo, state.token)) || { commits: {}, branchSHAs: {} };
+
+    state.loadingMsg = 'Fetching branches…'; render();
     const branches = await fetchAllPages(`${base}/branches`, state.token, 5);
-    const branchNames = branches.map(b => b.name).filter(n => !n.startsWith('staging/'));
+    const branchNames = branches.map(b => b.name).filter(n => !isExcluded(n, excludePrefixes));
 
-    // 2. Fetch commits from ALL branches, deduplicate by SHA
-    state.loadingMsg = `Fetching commits across ${branchNames.length} branches…`; render();
+    // 2. Fetch commits per branch (incremental). Commits are immutable by SHA,
+    // so for branches we've seen before we only need commits since lastFetch.
     const commitMap = new Map();
-    for (const branch of branchNames) {
-      const branchCommits = await fetchAllPages(
-        `${base}/commits?sha=${encodeURIComponent(branch)}&since=${sinceISO}`, state.token, 5
+    for (let i = 0; i < branchNames.length; i++) {
+      const branch = branchNames[i];
+      const cached = cache.branchSHAs[branch];
+
+      let fetchSinceISO = sinceISO;
+      const cachedInWindow = [];
+      if (cached?.lastFetch && new Date(cached.lastFetch) > since) {
+        // 1-minute overlap to avoid missing commits at the boundary.
+        const overlap = new Date(cached.lastFetch); overlap.setMinutes(overlap.getMinutes() - 1);
+        fetchSinceISO = overlap.toISOString();
+        for (const sha of cached.shas) {
+          const c = cache.commits[sha];
+          const d = c?.commit?.author?.date;
+          if (d && new Date(d) >= since) cachedInWindow.push(sha);
+        }
+      }
+
+      state.loadingMsg = cached
+        ? `Updating ${branch} (${i+1}/${branchNames.length}, ${cachedInWindow.length} cached)…`
+        : `Fetching ${branch} (${i+1}/${branchNames.length})…`;
+      render();
+
+      const fresh = await fetchAllPages(
+        `${base}/commits?sha=${encodeURIComponent(branch)}&since=${fetchSinceISO}`, state.token, 5
       );
-      for (const c of branchCommits) {
-        if (commitMap.has(c.sha)) {
-          commitMap.get(c.sha).branches.push(branch);
+      state.cacheStats.fromApi += fresh.length;
+      state.cacheStats.fromCache += cachedInWindow.length;
+
+      for (const c of fresh) cache.commits[c.sha] = c;
+
+      const branchShas = new Set([...cachedInWindow, ...fresh.map(c => c.sha)]);
+      cache.branchSHAs[branch] = {
+        shas: [...new Set([...(cached?.shas || []), ...fresh.map(c => c.sha)])],
+        lastFetch: new Date().toISOString(),
+      };
+
+      for (const sha of branchShas) {
+        const c = cache.commits[sha];
+        if (!c) continue;
+        if (commitMap.has(sha)) {
+          const entry = commitMap.get(sha);
+          if (!entry.branches.includes(branch)) entry.branches.push(branch);
         } else {
-          commitMap.set(c.sha, { commit: c, branches: [branch] });
+          commitMap.set(sha, { commit: c, branches: [branch] });
         }
       }
     }
     const allCommitsRaw = [...commitMap.values()];
+
+    pruneCache(cache);
+    await saveCache(state.repo, state.token, cache);
 
     // 3. Fetch PRs and review comments
     state.loadingMsg = 'Fetching PRs & reviews…'; render();
@@ -343,7 +501,7 @@ async function loadData() {
     ]);
 
     const filteredCommits = allCommitsRaw.filter(e => !isMergeMainCommit(e.commit.commit?.message));
-    const mergedPRs = prs.filter(p => p.merged_at && new Date(p.merged_at) >= since && !p.base?.ref?.startsWith('staging/'));
+    const mergedPRs = prs.filter(p => p.merged_at && new Date(p.merged_at) >= since && !isExcluded(p.base?.ref || '', excludePrefixes));
 
     // Build indexes
     const commitsByUD = {}, reviewsByUD = {}, prsByWeek = {}, prsByUW = {};
@@ -623,12 +781,23 @@ function renderSetup() {
   });
   form.append(daysRow);
 
+  form.append(el('label',{className:'form-label',innerHTML:'Excluded branch prefixes <span>(comma-separated, blank to include all)</span>',style:{marginTop:'4px'}}));
+  const excludeIn = el('input',{placeholder:'staging/, dev/',value:state.excludePrefixes});
+  excludeIn.addEventListener('input',e=>state.excludePrefixes=e.target.value);
+  form.append(excludeIn);
+
   const launchBtn = el('button',{className:'launch-btn',onClick:loadData,innerHTML:'⚡ Launch Arena'});
   if(!state.token||!state.repo) launchBtn.disabled = true;
   form.append(launchBtn);
 
   box.append(form);
-  box.append(el('p',{className:'footnote'},'Token is only sent to GitHub API. Nothing is stored.'));
+  const fn = el('p',{className:'footnote'},'Token is only sent to GitHub API. Commit cache is encrypted with a key derived from your token. ');
+  const clearLink = el('span',{
+    style:{color:'var(--accent)',cursor:'pointer',textDecoration:'underline'},
+    onClick:()=>{clearAllCaches();renderSetup();}
+  },'Clear cached commits');
+  fn.append(clearLink);
+  box.append(fn);
   wrap.append(box);
   app.append(wrap);
 }
@@ -649,7 +818,11 @@ function renderDashboard() {
 
   const header = el('div',{className:'dash-header'});
   const hLeft = el('div');
-  hLeft.append(el('h1',{},'🏆 Team Arena'), el('div',{className:'sub'},`${state.repo} · Last ${state.days} days · ${d.branchCount} branches`));
+  const cs = state.cacheStats;
+  const cacheNote = cs && cs.fromCache > 0
+    ? ` · ♻ ${cs.fromCache} cached, ${cs.fromApi} fetched`
+    : (cs ? ` · ${cs.fromApi} fetched` : '');
+  hLeft.append(el('h1',{},'🏆 Team Arena'), el('div',{className:'sub'},`${state.repo} · Last ${state.days} days · ${d.branchCount} branches${cacheNote}`));
   header.append(hLeft);
   header.append(el('button',{className:'back-btn',onClick:()=>{state.data=null;state.error=null;render();}},'← Back'));
   dash.append(header);
