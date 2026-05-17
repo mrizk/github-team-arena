@@ -1,0 +1,29 @@
+.*
+*.retry
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.iws
+*.log
+*.pid
+*.pem
+*.seed
+*.pid.lock
+*.lcov
+*.tgz
+*.box
+/bin/
+/vendor/
+/tmp/
+
+### Git ###
+!.gitkeep
+!.gitignore
+!.gitattributes
+
+### GitHub ###
+!.github/
