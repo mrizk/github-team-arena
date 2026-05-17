@@ -82,6 +82,15 @@
     padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border);
     background: transparent; color: var(--text-muted); font-size: 12px; cursor: pointer; font-weight: 600;
   }
+  .back-btn:hover { background: var(--surface-hover); color: var(--text); }
+  .header-actions { display: flex; gap: 8px; }
+
+  .warning-banner {
+    background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.35); border-radius: 10px;
+    padding: 10px 14px; margin-bottom: 16px; font-size: 12px; color: var(--gold);
+  }
+  .warning-banner ul { margin: 0; padding-left: 18px; }
+  .warning-banner .warn-title { font-weight: 700; margin-bottom: 4px; }
 
   .stats-ribbon { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; animation: fadeUp 0.4s ease-out; }
   .stat-badge {
@@ -241,11 +250,33 @@ const MEDAL = ['🥇','🥈','🥉'];
 const FIRE = { commits: 5, reviews: 3 };
 const DEFAULT_EXCLUDE_PREFIXES = 'staging/';
 
-function getInitialExcludePrefixes() {
-  const fromUrl = new URLSearchParams(window.location.search).get('exclude');
-  if (fromUrl != null) return fromUrl;
-  return localStorage.getItem('arena_exclude_prefixes') ?? DEFAULT_EXCLUDE_PREFIXES;
+const ALLOWED_DAYS = [7, 14, 30, 60];
+
+function getInitialConfig() {
+  const url = new URLSearchParams(window.location.search);
+
+  const repo = url.get('repo') ?? '';
+
+  const daysParam = Number(url.get('days'));
+  const days = ALLOWED_DAYS.includes(daysParam) ? daysParam : 14;
+
+  const excludeFromUrl = url.get('exclude');
+  const excludePrefixes = excludeFromUrl != null
+    ? excludeFromUrl
+    : (localStorage.getItem('arena_exclude_prefixes') ?? DEFAULT_EXCLUDE_PREFIXES);
+
+  return { repo, days, excludePrefixes };
 }
+
+function syncUrl() {
+  const url = new URL(window.location.href);
+  const set = (k, v, def) => v && v !== def ? url.searchParams.set(k, v) : url.searchParams.delete(k);
+  set('repo', state.repo);
+  set('days', String(state.days), '14');
+  set('exclude', state.excludePrefixes, DEFAULT_EXCLUDE_PREFIXES);
+  window.history.replaceState(null, '', url.toString());
+}
+
 function parseExcludePrefixes(str) {
   return (str || '').split(',').map(s => s.trim()).filter(Boolean);
 }
@@ -253,11 +284,14 @@ function isExcluded(name, prefixes) {
   return prefixes.some(p => name.startsWith(p));
 }
 
+const initialConfig = getInitialConfig();
 let state = {
-  token: '', repo: '', days: 14,
-  excludePrefixes: getInitialExcludePrefixes(),
+  token: '',
+  repo: initialConfig.repo,
+  days: initialConfig.days,
+  excludePrefixes: initialConfig.excludePrefixes,
   data: null, tab: 'leaderboard', loading: false, error: null, loadingMsg: '',
-  cacheStats: null,
+  cacheStats: null, warnings: [],
 };
 
 function getWeekStart(dateStr) {
@@ -394,22 +428,55 @@ function avatarEl(login, size = 36) {
   return img;
 }
 
-async function fetchAllPages(url, token, max = 10) {
-  const results = [];
+class GitHubError extends Error {
+  constructor(message, { status, resetAt, retryAfter } = {}) {
+    super(message);
+    this.status = status; this.resetAt = resetAt; this.retryAfter = retryAfter;
+  }
+}
+
+function parseGitHubError(res) {
+  const remaining = res.headers.get('x-ratelimit-remaining');
+  const reset = res.headers.get('x-ratelimit-reset');
+  const retryAfter = res.headers.get('retry-after');
+  if (res.status === 403 && remaining === '0' && reset) {
+    const resetAt = new Date(Number(reset) * 1000);
+    const mins = Math.max(1, Math.ceil((resetAt - Date.now()) / 60000));
+    return new GitHubError(
+      `GitHub API rate limit exceeded. Resets in ~${mins} min (at ${resetAt.toLocaleTimeString()}).`,
+      { status: 403, resetAt }
+    );
+  }
+  if (res.status === 429) {
+    const wait = retryAfter ? `${retryAfter}s` : 'a moment';
+    return new GitHubError(`GitHub API secondary rate limit hit. Retry after ${wait}.`, { status: 429, retryAfter });
+  }
+  if (res.status === 401) return new GitHubError('GitHub API rejected the token (401). Check the token is valid and has repo scope.', { status: 401 });
+  if (res.status === 404) return new GitHubError('Repository not found or token lacks access (404). Check the owner/repo and token scopes.', { status: 404 });
+  return new GitHubError(`GitHub API ${res.status}: ${res.statusText}`, { status: res.status });
+}
+
+// Returns { items, truncated, stopped }. `truncated` means we hit the page cap;
+// `stopped` means stopWhen fired (caller's predicate said no more pages needed).
+async function fetchAllPages(url, token, { max = 10, stopWhen } = {}) {
+  const items = [];
   let page = 1;
+  let truncated = false, stopped = false;
   while (page <= max) {
     const sep = url.includes('?') ? '&' : '?';
     const res = await fetch(`${url}${sep}per_page=100&page=${page}`, {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' }
     });
-    if (!res.ok) throw new Error(`GitHub API ${res.status}: ${res.statusText}`);
+    if (!res.ok) throw parseGitHubError(res);
     const d = await res.json();
     if (!d.length) break;
-    results.push(...d);
+    items.push(...d);
+    if (stopWhen && d.some(stopWhen)) { stopped = true; break; }
     if (d.length < 100) break;
+    if (page === max) { truncated = true; break; }
     page++;
   }
-  return results;
+  return { items, truncated, stopped };
 }
 
 function isMergeMainCommit(msg) {
@@ -422,6 +489,8 @@ function isMergeMainCommit(msg) {
 async function loadData() {
   state.loading = true; state.error = null; state.loadingMsg = 'Loading…';
   state.cacheStats = { fromCache: 0, fromApi: 0 };
+  state.warnings = [];
+  syncUrl();
   render();
   try {
     const since = new Date(); since.setDate(since.getDate() - state.days);
@@ -434,8 +503,9 @@ async function loadData() {
     const cache = (await loadCache(state.repo, state.token)) || { commits: {}, branchSHAs: {} };
 
     state.loadingMsg = 'Fetching branches…'; render();
-    const branches = await fetchAllPages(`${base}/branches`, state.token, 5);
-    const branchNames = branches.map(b => b.name).filter(n => !isExcluded(n, excludePrefixes));
+    const branchesRes = await fetchAllPages(`${base}/branches`, state.token, { max: 5 });
+    if (branchesRes.truncated) state.warnings.push('Branch list exceeded 500 entries — only the first 500 were considered.');
+    const branchNames = branchesRes.items.map(b => b.name).filter(n => !isExcluded(n, excludePrefixes));
 
     // 2. Fetch commits per branch (incremental). Commits are immutable by SHA,
     // so for branches we've seen before we only need commits since lastFetch.
@@ -462,9 +532,11 @@ async function loadData() {
         : `Fetching ${branch} (${i+1}/${branchNames.length})…`;
       render();
 
-      const fresh = await fetchAllPages(
-        `${base}/commits?sha=${encodeURIComponent(branch)}&since=${fetchSinceISO}`, state.token, 5
+      const freshRes = await fetchAllPages(
+        `${base}/commits?sha=${encodeURIComponent(branch)}&since=${fetchSinceISO}`, state.token, { max: 5 }
       );
+      const fresh = freshRes.items;
+      if (freshRes.truncated) state.warnings.push(`Branch "${branch}" had more than 500 commits in the window — counts may be incomplete.`);
       state.cacheStats.fromApi += fresh.length;
       state.cacheStats.fromCache += cachedInWindow.length;
 
@@ -492,15 +564,21 @@ async function loadData() {
     pruneCache(cache);
     await saveCache(state.repo, state.token, cache);
 
-    // 3. Fetch PRs and review comments
+    // 3. Fetch PRs and review comments. PRs are sorted updated-desc; once we
+    // see one updated before `since`, every later page is older too — stop.
     state.loadingMsg = 'Fetching PRs & reviews…'; render();
-    const [prs, reviewComments] = await Promise.all([
-      fetchAllPages(`${base}/pulls?state=closed&sort=updated&direction=desc`, state.token),
+    const [prsRes, reviewsRes] = await Promise.all([
+      fetchAllPages(`${base}/pulls?state=closed&sort=updated&direction=desc`, state.token, {
+        stopWhen: p => p.updated_at && new Date(p.updated_at) < since,
+      }),
       fetchAllPages(`${base}/pulls/comments?since=${sinceISO}&sort=created&direction=desc`, state.token),
     ]);
+    if (prsRes.truncated) state.warnings.push('Closed-PR list exceeded the page cap — older merged PRs may be missing.');
+    if (reviewsRes.truncated) state.warnings.push('Review-comment list exceeded the page cap — counts may be incomplete.');
 
     const filteredCommits = allCommitsRaw.filter(e => !isMergeMainCommit(e.commit.commit?.message));
-    const mergedPRs = prs.filter(p => p.merged_at && new Date(p.merged_at) >= since && !isExcluded(p.base?.ref || '', excludePrefixes));
+    const mergedPRs = prsRes.items.filter(p => p.merged_at && new Date(p.merged_at) >= since && !isExcluded(p.base?.ref || '', excludePrefixes));
+    const reviewComments = reviewsRes.items;
 
     // Build indexes
     const commitsByUD = {}, reviewsByUD = {}, prsByWeek = {}, prsByUW = {};
@@ -510,9 +588,9 @@ async function loadData() {
 
     filteredCommits.forEach(e => {
       const c = e.commit;
-      const login = c.author?.login||c.commit?.author?.name||'unknown';
+      const login = c.author?.login || c.commit?.author?.name;
       const day = (c.commit?.author?.date||'').slice(0,10);
-      if (!day) return;
+      if (!day || !login) return;
       const key = `${login}||${day}`;
       commitsByUD[key] = (commitsByUD[key]||0)+1;
       userCommits[login] = (userCommits[login]||0)+1;
@@ -523,9 +601,9 @@ async function loadData() {
     });
 
     reviewComments.forEach(r => {
-      const login = r.user?.login||'unknown';
+      const login = r.user?.login;
       const day = (r.created_at||'').slice(0,10);
-      if (!day) return;
+      if (!day || !login) return;
       const key = `${login}||${day}`;
       reviewsByUD[key] = (reviewsByUD[key]||0)+1;
       userReviews[login] = (userReviews[login]||0)+1;
@@ -538,8 +616,9 @@ async function loadData() {
     mergedPRs.forEach(p => {
       const day = p.merged_at.slice(0,10);
       const week = getWeekStart(day);
+      const login = p.user?.login;
+      if (!login) return;
       prsByWeek[week] = (prsByWeek[week]||0)+1;
-      const login = p.user?.login||'unknown';
       const key = `${login}||${week}`;
       prsByUW[key] = (prsByUW[key]||0)+1;
       userPRs[login] = (userPRs[login]||0)+1;
@@ -825,8 +904,22 @@ function renderDashboard() {
     : (cs ? ` · ${cs.fromApi} fetched` : '');
   hLeft.append(el('h1',{},'🏆 Team Arena'), el('div',{className:'sub'},`${state.repo} · Last ${state.days} days · ${d.branchCount} branches${cacheNote}`));
   header.append(hLeft);
-  header.append(el('button',{className:'back-btn',onClick:()=>{state.data=null;state.error=null;render();}},'← Back'));
+  const actions = el('div',{className:'header-actions'});
+  actions.append(
+    el('button',{className:'back-btn',onClick:loadData,title:'Re-fetch from GitHub'},'↻ Refresh'),
+    el('button',{className:'back-btn',onClick:()=>{state.data=null;state.error=null;render();}},'← Back'),
+  );
+  header.append(actions);
   dash.append(header);
+
+  if (state.warnings && state.warnings.length) {
+    const banner = el('div',{className:'warning-banner'});
+    banner.append(el('div',{className:'warn-title'},'⚠ Partial results'));
+    const ul = el('ul');
+    state.warnings.forEach(w => ul.append(el('li',{},w)));
+    banner.append(ul);
+    dash.append(banner);
+  }
 
   const ribbon = el('div',{className:'stats-ribbon'});
   [{i:'⚡',v:d.totalCommits,l:'Commits',c:'var(--accent)'},{i:'💬',v:d.totalReviews,l:'Review Comments',c:'var(--purple)'},
