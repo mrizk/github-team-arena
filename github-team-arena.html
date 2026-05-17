@@ -764,14 +764,16 @@ function renderSetup() {
   if (state.error) box.append(el('div',{className:'error-box'},state.error));
 
   const form = el('div',{className:'form-group'});
+  const updateLaunchDisabled = () => { launchBtn.disabled = !state.token || !state.repo; };
+
   form.append(el('label',{className:'form-label',innerHTML:'GitHub Token <span>(needs repo scope)</span>'}));
   const tokIn = el('input',{type:'password',placeholder:'ghp_xxxxxxxxxxxx',value:state.token});
-  tokIn.addEventListener('input',e=>state.token=e.target.value);
+  tokIn.addEventListener('input',e=>{state.token=e.target.value;updateLaunchDisabled();});
   form.append(tokIn);
 
   form.append(el('label',{className:'form-label',innerHTML:'Repository <span>(owner/repo)</span>',style:{marginTop:'4px'}}));
   const repoIn = el('input',{placeholder:'octocat/hello-world',value:state.repo});
-  repoIn.addEventListener('input',e=>state.repo=e.target.value);
+  repoIn.addEventListener('input',e=>{state.repo=e.target.value;updateLaunchDisabled();});
   form.append(repoIn);
 
   form.append(el('label',{className:'form-label',style:{marginTop:'4px'}},'Lookback (days)'));
@@ -787,7 +789,7 @@ function renderSetup() {
   form.append(excludeIn);
 
   const launchBtn = el('button',{className:'launch-btn',onClick:loadData,innerHTML:'⚡ Launch Arena'});
-  if(!state.token||!state.repo) launchBtn.disabled = true;
+  updateLaunchDisabled();
   form.append(launchBtn);
 
   box.append(form);
