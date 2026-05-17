@@ -4,6 +4,18 @@ A single-file dashboard that turns a GitHub repo into a friendly leaderboard. Tr
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
+## Screenshots
+
+![GitHub Team Arena dashboard](docs/Launch_Page.png)
+
+![GitHub Team Arena dashboard](docs/Leaderboard.png)
+
+![GitHub Team Arena dashboard](docs/Commits.png)
+
+![GitHub Team Arena dashboard](docs/Reviews.png)
+
+![GitHub Team Arena dashboard](docs/PRs.png)
+
 ## Features
 
 - **Leaderboards** — top contributors for commits, review comments, and merged PRs, with medals for the top 3 and a 🔥 badge for users who are over the daily threshold today.
