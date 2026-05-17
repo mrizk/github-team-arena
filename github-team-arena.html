@@ -93,7 +93,7 @@
   .warning-banner ul { margin: 0; padding-left: 18px; }
   .warning-banner .warn-title { font-weight: 700; margin-bottom: 4px; }
 
-  .stats-ribbon { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; animation: fadeUp 0.4s ease-out; }
+  .stats-ribbon { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
   .stat-badge {
     background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
     padding: 14px 18px; flex: 1 1 140px; min-width: 140px; text-align: center;
@@ -112,8 +112,6 @@
     background: transparent; color: var(--text-muted);
   }
   .tab-btn.active { background: var(--accent); color: var(--bg); }
-
-  .tab-content { animation: fadeUp 0.3s ease-out; }
 
   .leaders-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
   .leader-section h3 { font-size: 14px; font-weight: 700; margin: 0 0 10px; display: flex; align-items: center; gap: 6px; }
@@ -332,6 +330,7 @@ let state = {
   data: null, tab: 'leaderboard', loading: false, error: null, loadingMsg: '',
   cacheStats: null, warnings: [],
   anonymized: false, anonMap: {},
+  teams: [], enabledTeams: new Set(), teamsError: null, userTeamPreference: {},
 };
 
 function getWeekStart(dateStr) {
@@ -629,14 +628,42 @@ async function loadData() {
     if (prsRes.truncated) state.warnings.push('Closed-PR list exceeded the page cap — older merged PRs may be missing.');
     if (reviewsRes.truncated) state.warnings.push('Review-comment list exceeded the page cap — counts may be incomplete.');
 
+    // Fetch org teams (best-effort; needs read:org scope and an org owner).
+    const [owner] = state.repo.split('/');
+    const prevEnabledTeams = state.enabledTeams;
+    state.teams = []; state.teamsError = null;
+    if (owner) {
+      state.loadingMsg = 'Fetching teams…'; render();
+      try {
+        const teamsRes = await fetchAllPages(`https://api.github.com/orgs/${owner}/teams`, state.token, { max: 5 });
+        const teams = [];
+        for (let i = 0; i < teamsRes.items.length; i++) {
+          const t = teamsRes.items[i];
+          state.loadingMsg = `Fetching team members (${i+1}/${teamsRes.items.length})…`; render();
+          const membersRes = await fetchAllPages(`https://api.github.com/orgs/${owner}/teams/${t.slug}/members`, state.token, { max: 5 });
+          teams.push({ slug: t.slug, name: t.name, members: new Set(membersRes.items.map(m => m.login)) });
+        }
+        state.teams = teams;
+        const allSlugs = new Set(teams.map(t => t.slug));
+        state.enabledTeams = prevEnabledTeams && prevEnabledTeams.size
+          ? new Set([...prevEnabledTeams].filter(s => allSlugs.has(s)))
+          : new Set();
+      } catch (e) {
+        state.teamsError = e.status === 404
+          ? 'No teams found. The owner may be a user account, or the token lacks read:org scope.'
+          : (e.message || 'Could not load teams.');
+        state.enabledTeams = new Set();
+      }
+    }
+
     const filteredCommits = allCommitsRaw.filter(e => !isMergeMainCommit(e.commit.commit?.message));
     const mergedPRs = prsRes.items.filter(p => p.merged_at && new Date(p.merged_at) >= since && !isExcluded(p.base?.ref || '', excludePrefixes));
     const reviewComments = reviewsRes.items;
 
     // Build indexes
-    const commitsByUD = {}, reviewsByUD = {}, prsByWeek = {}, prsByUW = {};
+    const commitsByUD = {}, reviewsByUD = {}, prsByWeek = {}, prsByUW = {}, prsByUD = {};
     const userCommits = {}, userReviews = {}, userPRs = {};
-    const rawCommitsByUD = {}, rawReviewsByUD = {}, rawPRsByUW = {};
+    const rawCommitsByUD = {}, rawReviewsByUD = {}, rawPRsByUW = {}, rawPRsByUD = {};
     const rawCommitsByUser = {}, rawReviewsByUser = {}, rawPRsByUser = {};
 
     filteredCommits.forEach(e => {
@@ -677,6 +704,10 @@ async function loadData() {
       userPRs[login] = (userPRs[login]||0)+1;
       if (!rawPRsByUW[key]) rawPRsByUW[key] = [];
       rawPRsByUW[key].push(p);
+      const dkey = `${login}||${day}`;
+      prsByUD[dkey] = (prsByUD[dkey]||0)+1;
+      if (!rawPRsByUD[dkey]) rawPRsByUD[dkey] = [];
+      rawPRsByUD[dkey].push(p);
       if (!rawPRsByUser[login]) rawPRsByUser[login] = [];
       rawPRsByUser[login].push(p);
     });
@@ -694,7 +725,7 @@ async function loadData() {
     state.anonMap = buildAnonMap(allUsers);
 
     state.data = {
-      commitsByUD, reviewsByUD, prsByWeek, prsByUW,
+      commitsByUD, reviewsByUD, prsByWeek, prsByUW, prsByUD,
       userCommits, userReviews, userPRs,
       todayCommits, todayReviews,
       allDays, allWeeks, allUsers,
@@ -702,7 +733,7 @@ async function loadData() {
       totalReviews: reviewComments.length,
       totalMergedPRs: mergedPRs.length,
       branchCount: branchNames.length,
-      rawCommitsByUD, rawReviewsByUD, rawPRsByUW,
+      rawCommitsByUD, rawReviewsByUD, rawPRsByUW, rawPRsByUD,
       rawCommitsByUser, rawReviewsByUser, rawPRsByUser,
     };
     state.loading = false;
@@ -806,6 +837,26 @@ function renderPRItems(container, items) {
     }
     container.append(item);
   });
+}
+
+function renderTeamDayDrawer(container, team, day, userAssignment) {
+  const d = state.data;
+  const commits = [], reviews = [], prs = [];
+  team.members.forEach(login => {
+    if (userAssignment && userAssignment[login] !== team.slug) return;
+    const k = `${login}||${day}`;
+    if (d.rawCommitsByUD[k]) commits.push(...d.rawCommitsByUD[k]);
+    if (d.rawReviewsByUD[k]) reviews.push(...d.rawReviewsByUD[k]);
+    if (d.rawPRsByUD[k]) prs.push(...d.rawPRsByUD[k]);
+  });
+  if (!commits.length && !reviews.length && !prs.length) {
+    container.append(el('div',{className:'drawer-empty'},'No activity found for this team on this day.'));
+    return;
+  }
+  const sectionH = (color, text) => el('h3',{style:{fontSize:'13px',fontWeight:'700',color,margin:'16px 0 6px'}}, text);
+  if (commits.length) { container.append(sectionH('var(--accent)', '⚡ Commits')); renderCommitItems(container, commits); }
+  if (reviews.length) { container.append(sectionH('var(--purple)', '💬 Review Comments')); renderReviewItems(container, reviews); }
+  if (prs.length)     { container.append(sectionH('var(--green)',  '🚀 Merged PRs'));     renderPRItems(container, prs); }
 }
 
 // ── Render helpers ──
@@ -992,7 +1043,7 @@ function renderDashboard() {
   dash.append(ribbon);
 
   const tabs = el('div',{className:'tabs'});
-  [{k:'leaderboard',l:'🏅 Leaderboard'},{k:'commits',l:'⚡ Commits'},{k:'reviews',l:'💬 Reviews'},{k:'prs',l:'🚀 PRs'}].forEach(t=>{
+  [{k:'leaderboard',l:'🏅 Leaderboard'},{k:'commits',l:'⚡ Commits'},{k:'reviews',l:'💬 Reviews'},{k:'prs',l:'🚀 PRs'},{k:'teams',l:'👥 Teams'}].forEach(t=>{
     tabs.append(el('button',{className:'tab-btn'+(state.tab===t.k?' active':''),onClick:()=>{state.tab=t.k;renderDashboard();}},t.l));
   });
   dash.append(tabs);
@@ -1114,6 +1165,168 @@ function renderDashboard() {
     });
     table.append(tbody); wrap.append(table);
     content.append(wrap);
+  }
+
+  // ── TEAMS TAB ──
+  if (state.tab === 'teams') {
+    content.append(el('h3',{style:{fontSize:'14px',fontWeight:'700',color:'var(--gold)',margin:'0 0 4px'}},'👥 Team Output per Day'));
+    content.append(el('p',{style:{fontSize:'11px',color:'var(--text-dim)',margin:'0 0 14px'}},'Toggle teams to filter. Each cell sums commits + review comments + merged PRs for that team-day. Click any highlighted cell for the breakdown.'));
+
+    if (state.teamsError) {
+      content.append(el('div',{className:'error-box'},state.teamsError));
+    } else if (!state.teams.length) {
+      content.append(el('p',{className:'empty'},'No teams found for this repository owner.'));
+    } else {
+      const chipBar = el('div',{style:{display:'flex',flexWrap:'wrap',gap:'6px',marginBottom:'16px'}});
+      const mkChip = (label, onClick, active = false, mute = false) => el('button',{
+        className:'day-btn'+(active?' active':''),
+        style:{flex:'0 0 auto',padding:'6px 12px',fontSize:'12px',opacity:mute?'0.75':'1'},
+        onClick,
+      }, label);
+      chipBar.append(mkChip('All', ()=>{state.enabledTeams=new Set(state.teams.map(t=>t.slug));renderDashboard();}, false, true));
+      chipBar.append(mkChip('None', ()=>{state.enabledTeams=new Set();renderDashboard();}, false, true));
+      state.teams.forEach(t => {
+        const active = state.enabledTeams.has(t.slug);
+        chipBar.append(mkChip(`${t.name} (${t.members.size})`, ()=>{
+          if (active) state.enabledTeams.delete(t.slug); else state.enabledTeams.add(t.slug);
+          renderDashboard();
+        }, active));
+      });
+      content.append(chipBar);
+
+      const enabledTeams = state.teams.filter(t => state.enabledTeams.has(t.slug));
+      if (!enabledTeams.length) {
+        content.append(el('p',{className:'empty'},'No teams selected — toggle a team above to see output.'));
+      } else {
+        // Build login -> [enabled teams the user belongs to]
+        const userTeams = {};
+        enabledTeams.forEach(t => {
+          t.members.forEach(login => {
+            if (!userTeams[login]) userTeams[login] = [];
+            userTeams[login].push(t);
+          });
+        });
+
+        // Resolve each user to exactly one team (preference if set, else first alphabetically).
+        const userAssignment = {};
+        Object.entries(userTeams).forEach(([login, teams]) => {
+          if (teams.length === 1) { userAssignment[login] = teams[0].slug; return; }
+          const pref = state.userTeamPreference[login];
+          if (pref && teams.some(t => t.slug === pref)) { userAssignment[login] = pref; return; }
+          userAssignment[login] = [...teams].sort((a,b)=>a.name.localeCompare(b.name))[0].slug;
+        });
+
+        // Conflict panel — only users in 2+ enabled teams who have activity in the window.
+        const conflicts = Object.entries(userTeams)
+          .filter(([login, teams]) => teams.length > 1)
+          .filter(([login]) => (d.userCommits[login]||0) + (d.userReviews[login]||0) + (d.userPRs[login]||0) > 0)
+          .sort((a,b) => a[0].localeCompare(b[0]));
+        if (conflicts.length) {
+          const panel = el('div',{style:{
+            background:'var(--surface)', border:'1px solid var(--border)', borderRadius:'12px',
+            padding:'12px 14px', marginBottom:'16px',
+          }});
+          panel.append(el('div',{style:{
+            fontSize:'12px', fontWeight:'700', color:'var(--text-muted)', marginBottom:'4px',
+          }}, `Multi-team users (${conflicts.length}) — pick which team counts each`));
+          conflicts.forEach(([login, teams]) => {
+            const row = el('div',{style:{
+              display:'flex', alignItems:'center', gap:'8px', flexWrap:'wrap',
+              padding:'8px 0', borderTop:'1px solid var(--border)',
+            }});
+            const userBox = el('div',{style:{display:'flex',alignItems:'center',gap:'6px',minWidth:'160px',flex:'0 0 auto'}});
+            userBox.append(userAvatarEl(login, 22), el('span',{style:{fontSize:'12px',fontWeight:'600'}}, displayName(login)));
+            row.append(userBox);
+            teams.forEach(t => {
+              const active = userAssignment[login] === t.slug;
+              row.append(el('button',{
+                className:'day-btn'+(active?' active':''),
+                style:{flex:'0 0 auto',padding:'4px 10px',fontSize:'11px'},
+                onClick:()=>{ state.userTeamPreference[login] = t.slug; renderDashboard(); },
+              }, t.name));
+            });
+            panel.append(row);
+          });
+          content.append(panel);
+        }
+
+        const teamCellByTD = {};
+        const teamTotals = {};
+        enabledTeams.forEach(t => {
+          let teamTotal = 0;
+          d.allDays.forEach(day => {
+            let cc = 0, rc = 0, pc = 0;
+            t.members.forEach(login => {
+              if (userAssignment[login] !== t.slug) return;
+              cc += d.commitsByUD[`${login}||${day}`] || 0;
+              rc += d.reviewsByUD[`${login}||${day}`] || 0;
+              pc += d.prsByUD[`${login}||${day}`] || 0;
+            });
+            const total = cc + rc + pc;
+            teamCellByTD[`${t.slug}||${day}`] = { commits: cc, reviews: rc, prs: pc, total };
+            teamTotal += total;
+          });
+          teamTotals[t.slug] = teamTotal;
+        });
+
+        const dayTotals = {};
+        d.allDays.forEach(day => {
+          let dt = 0;
+          enabledTeams.forEach(t => { dt += teamCellByTD[`${t.slug}||${day}`].total; });
+          dayTotals[day] = dt;
+        });
+
+        const sortedTeams = [...enabledTeams].sort((a,b) => (teamTotals[b.slug]||0) - (teamTotals[a.slug]||0));
+
+        const wrap = el('div',{style:{overflowX:'auto'}});
+        const table = el('table');
+        const thead = el('thead'); const hrow = el('tr');
+        hrow.append(el('th',{},'Team'));
+        d.allDays.forEach(day => hrow.append(el('th',{},dayLabel(day))));
+        hrow.append(el('th',{className:'total-col'},'Total'));
+        thead.append(hrow); table.append(thead);
+
+        const tbody = el('tbody');
+        sortedTeams.forEach(t => {
+          const tr = el('tr');
+          const uCell = el('td');
+          uCell.append(el('span',{style:{fontWeight:'700'}}, t.name));
+          tr.append(uCell);
+          d.allDays.forEach(day => {
+            const cell = teamCellByTD[`${t.slug}||${day}`];
+            const v = cell.total;
+            const dt = dayTotals[day] || 0;
+            const pct = dt > 0 ? Math.round((v / dt) * 100) : 0;
+            const intensity = Math.min(v/15,1);
+            const td = el('td',{
+              className: v > 0 ? 'clickable' : '',
+              title: v > 0 ? `${cell.commits} commits · ${cell.reviews} reviews · ${cell.prs} merged PRs (${pct}% of day total ${dt})` : '',
+              style:{
+                background: v>0?`rgba(251,191,36,${(0.08+intensity*0.35).toFixed(2)})`:'transparent',
+                color: v>0?'var(--gold)':'var(--text-dim)',
+                fontWeight: v>0?'700':'400',
+              },
+            });
+            if (v > 0) {
+              td.append(
+                el('div',{style:{lineHeight:'1.1'}}, String(v)),
+                el('div',{style:{fontSize:'9px',fontWeight:'500',opacity:'0.65',marginTop:'1px'}}, `${pct}%`),
+              );
+              td.addEventListener('click', () => {
+                openDrawer(`👥 ${t.name} — ${dayLabel(day)}`, body => renderTeamDayDrawer(body, t, day, userAssignment));
+              });
+            } else {
+              td.append('·');
+            }
+            tr.append(td);
+          });
+          tr.append(el('td',{className:'total-col'}, String(teamTotals[t.slug] || 0)));
+          tbody.append(tr);
+        });
+        table.append(tbody); wrap.append(table);
+        content.append(wrap);
+      }
+    }
   }
 
   dash.append(content);
